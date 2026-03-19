@@ -90,11 +90,43 @@ EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' WHER
 analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*
 
 # -----------------------------------------------------------------------
-# Edge case: no filter -> deferred NOT activated
+# No filter, heavy bytes ≥ 50%: deferred IS activated
+# (blob_data is ~2000 bytes/row vs ~30 bytes for other columns combined,
+#  so heavy bytes dominate — deferred materialization kicks in.)
 # -----------------------------------------------------------------------
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*
+
+# Correctness: no filter + deferred returns all rows with correct data
+query II
+SELECT id, octet_length(blob_data) FROM 'test/.tmp/deferred_mat.lance' ORDER BY id;
+----
+1	2000
+2	2000
+3	2000
+4	2000
+5	2000
+6	2000
+7	2000
+8	2000
+
+# -----------------------------------------------------------------------
+# No filter, heavy bytes < 50%: deferred NOT activated
+# -----------------------------------------------------------------------
+
+statement ok
+COPY (
+  SELECT i::BIGINT AS id, (i % 10)::INTEGER AS category,
+         repeat('n', 20)::VARCHAR AS name,
+         repeat('x', 100)::BLOB AS small_blob
+  FROM range(1, 9) t(i)
+) TO 'test/.tmp/deferred_light.lance' (FORMAT lance, mode 'overwrite');
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_light.lance';
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
 
@@ -144,4 +176,79 @@ query II
 SELECT id, octet_length(heavy) FROM 'test/.tmp/deferred_multi.lance' WHERE id::VARCHAR LIKE '%5%' OR id::VARCHAR LIKE '%7%' ORDER BY id;
 ----
 5	2000
+7	2000
+
+# -----------------------------------------------------------------------
+# ORDER BY + LIMIT without filter: deferred IS activated for heavy tables
+# (This is the key scenario — ORDER BY reads only light columns in the
+#  fragment scan, then takes heavy columns for surviving rows per batch.)
+# -----------------------------------------------------------------------
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' ORDER BY id LIMIT 3;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*
+
+# Correctness: ORDER BY + LIMIT returns correct sorted rows with data
+query II
+SELECT id, octet_length(blob_data) FROM 'test/.tmp/deferred_mat.lance' ORDER BY id LIMIT 3;
+----
+1	2000
+2	2000
+3	2000
+
+query II
+SELECT id, octet_length(blob_data) FROM 'test/.tmp/deferred_mat.lance' ORDER BY id DESC LIMIT 2;
+----
+8	2000
+7	2000
+
+# -----------------------------------------------------------------------
+# ORDER BY without LIMIT: deferred still activated for heavy tables
+# -----------------------------------------------------------------------
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' ORDER BY category;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*
+
+# -----------------------------------------------------------------------
+# No filter + deferred disabled by setting: falls back to full scan
+# -----------------------------------------------------------------------
+
+statement ok
+SET lance_deferred_materialization = false;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' ORDER BY id LIMIT 3;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
+
+# Correctness still holds when disabled
+query II
+SELECT id, octet_length(blob_data) FROM 'test/.tmp/deferred_mat.lance' ORDER BY id LIMIT 3;
+----
+1	2000
+2	2000
+3	2000
+
+statement ok
+SET lance_deferred_materialization = true;
+
+# -----------------------------------------------------------------------
+# Multi-fragment: ORDER BY + no filter + deferred correctness
+# -----------------------------------------------------------------------
+
+query II
+SELECT id, octet_length(heavy) FROM 'test/.tmp/deferred_multi.lance' ORDER BY id LIMIT 4;
+----
+1	2000
+2	2000
+3	2000
+4	2000
+
+query II
+SELECT id, octet_length(heavy) FROM 'test/.tmp/deferred_multi.lance' ORDER BY id DESC LIMIT 2;
+----
+8	2000
 7	2000

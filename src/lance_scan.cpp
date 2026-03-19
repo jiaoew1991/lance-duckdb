@@ -1164,34 +1164,44 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   }
 
   // -- Deferred materialization for heavy columns --
-  // Activates when DuckDB has filters that were NOT fully pushed to Lance,
-  // meaning DuckDB will filter post-scan. We defer heavy columns to avoid
-  // reading them for rows that will be filtered out.
-  // (When filter IS pushed, Lance SDK handles late materialization internally.)
+  // Activates in two scenarios:
+  // (A) DuckDB has filters NOT fully pushed to Lance — defer heavy columns to
+  //     avoid reading them for rows that will be filtered out post-scan.
+  // (B) No filters, but heavy columns exist — defer them so the fragment scan
+  //     reads only lightweight columns. The per-batch take reads the same
+  //     rows, but skipping heavy columns (embeddings, BLOBs, large arrays)
+  //     in the initial scan significantly reduces I/O for wide tables.
+  // When filter IS pushed to Lance, the SDK handles late materialization
+  // internally, so we skip.
+  bool has_duckdb_filters = input.filters && !input.filters->filters.empty();
   if (!scan_state.sampling_pushed_down && !scan_state.filter_pushed_down &&
-      !scan_state.scan_column_names.empty() && input.filters &&
-      !input.filters->filters.empty() &&
-      LanceDeferredMaterializationEnabled(context)) {
+      !scan_state.scan_column_names.empty() &&
+      LanceDeferredMaterializationEnabled(context) &&
+      (has_duckdb_filters || !scan_state.limit_offset_pushed_down)) {
     // Collect columns referenced by DuckDB-side filters.
     unordered_set<string> filter_referenced_columns;
-    for (auto &it : input.filters->filters) {
-      auto scan_col_idx = it.first;
-      if (scan_col_idx < input.column_ids.size()) {
-        auto col_id = input.column_ids[scan_col_idx];
-        if (col_id < bind_data.names.size()) {
-          filter_referenced_columns.insert(bind_data.names[col_id]);
+    if (has_duckdb_filters) {
+      for (auto &it : input.filters->filters) {
+        auto scan_col_idx = it.first;
+        if (scan_col_idx < input.column_ids.size()) {
+          auto col_id = input.column_ids[scan_col_idx];
+          if (col_id < bind_data.names.size()) {
+            filter_referenced_columns.insert(bind_data.names[col_id]);
+          }
         }
       }
     }
 
     // Detect heavy columns: stats-based with type-based fallback.
     unordered_set<string> heavy_columns;
+    unordered_set<string> stats_covered;
+    uint64_t heavy_bytes_total = 0;
+    uint64_t all_bytes_total = 0;
     auto total_rows = lance_dataset_count_rows(bind_data.dataset);
     if (total_rows > 0) {
       size_t stats_len = 0;
       auto stats =
           lance_dataset_list_named_field_stats(bind_data.dataset, &stats_len);
-      unordered_set<string> stats_covered;
       if (stats) {
         for (size_t i = 0; i < stats_len; i++) {
           if (!stats[i].name) {
@@ -1199,10 +1209,12 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
           }
           string col_name = stats[i].name;
           stats_covered.insert(col_name);
+          all_bytes_total += stats[i].bytes_on_disk;
           auto avg_bytes =
               stats[i].bytes_on_disk / static_cast<uint64_t>(total_rows);
           if (avg_bytes > DEFERRED_AVG_BYTES_THRESHOLD) {
             heavy_columns.insert(col_name);
+            heavy_bytes_total += stats[i].bytes_on_disk;
           }
         }
         lance_free_named_field_stats_list(stats, stats_len);
@@ -1227,6 +1239,32 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     for (idx_t i = 0; i < scan_state.scan_column_names.size(); i++) {
       if (heavy_columns.count(scan_state.scan_column_names[i])) {
         heavy_scan_indices.insert(i);
+      }
+    }
+
+    // Without filters every row survives the scan, so the per-batch take
+    // still fetches heavy columns for all rows. Only activate when heavy
+    // columns account for a significant share of total on-disk bytes (≥ 50%).
+    // A single large column (e.g. image BLOB, embedding vector) can easily
+    // dominate total I/O — skipping it in the fragment scan is worthwhile
+    // even if the take path re-reads the same data.
+    // When byte stats are incomplete or unavailable, type-based heavy column
+    // detection (BLOB, large ARRAY, MAP, etc.) is already conservative enough
+    // to be trusted — these types are almost always large on disk.
+    if (!has_duckdb_filters && !heavy_scan_indices.empty() &&
+        all_bytes_total > 0) {
+      // Only apply the bytes threshold when we have reliable stats.
+      // Type-only heavy columns (no byte stats) bypass this check.
+      bool all_heavy_have_stats = true;
+      for (auto &name : heavy_columns) {
+        if (stats_covered.count(name) == 0) {
+          all_heavy_have_stats = false;
+          break;
+        }
+      }
+      if (all_heavy_have_stats &&
+          heavy_bytes_total * 2 < all_bytes_total) {
+        heavy_scan_indices.clear();
       }
     }
 
