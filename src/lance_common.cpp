@@ -235,7 +235,14 @@ bool TryLanceNamespaceListTables(
   vector<string> parts = StringUtil::Split(joined, '\n');
   for (auto &p : parts) {
     if (!p.empty()) {
-      out_tables.push_back(std::move(p));
+      // The FFI may return "name\tschema_json" entries; strip the schema
+      // suffix so callers receive plain table names.
+      auto tab_pos = p.find('\t');
+      if (tab_pos != string::npos) {
+        out_tables.push_back(p.substr(0, tab_pos));
+      } else {
+        out_tables.push_back(std::move(p));
+      }
     }
   }
   return true;

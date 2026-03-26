@@ -162,7 +162,6 @@ fn list_tables_inner(
                     .build();
                 let mut req = DescribeTableRequest::new();
                 req.id = Some(vec![table_name.clone()]);
-                req.with_table_uri = Some(true);
                 req.load_detailed_metadata = Some(true);
                 let schema_json = match ns.describe_table(req).await {
                     Ok(resp) => resp.schema.and_then(|s| serde_json::to_string(&s).ok()),
