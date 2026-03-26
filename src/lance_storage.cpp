@@ -418,7 +418,32 @@ public:
       }
     }
 
-    // Fast path: describe_table with schema from REST API (skips S3 open).
+    // Check prefetched schema cache first (populated by GetDefaultEntries).
+    {
+      auto it = prefetched_schemas.find(entry_name);
+      if (it == prefetched_schemas.end()) {
+        for (auto &cand : candidates) {
+          it = prefetched_schemas.find(cand);
+          if (it != prefetched_schemas.end()) break;
+        }
+      }
+      if (it != prefetched_schemas.end() && !it->second.empty()) {
+        CreateTableInfo info(schema, entry_name);
+        info.internal = true;
+        info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+        try {
+          PopulateLanceTableColumnsFromJsonSchema(context, it->second,
+                                                  info.columns);
+        } catch (...) {
+          // Schema conversion failed, fall through to single-table describe.
+        }
+        if (!info.columns.empty()) {
+          return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info));
+        }
+      }
+    }
+
+    // Cache miss: describe_table with schema from REST API (skips S3 open).
     for (auto &table_id : candidates) {
       string schema_json;
       if (!TryDescribeTableWithSchema(table_id, resolved_bearer,
@@ -467,19 +492,46 @@ public:
   }
 
   vector<string> GetDefaultEntries() override {
-    auto tables = ListRestNamespaceTables(endpoint, namespace_id, bearer_token,
-                                          api_key, delimiter, headers_tsv);
-    if (namespace_id.empty()) {
-      return tables;
-    }
+    // list_tables now returns "name\tschema_json" or "name" per entry.
+    // Parse the tab-separated schema and populate the prefetch cache.
+    auto raw_entries = ListRestNamespaceTables(
+        endpoint, namespace_id, bearer_token, api_key, delimiter, headers_tsv);
+
     auto delim = delimiter.empty() ? "$" : delimiter;
-    auto prefix = namespace_id + delim;
-    for (auto &t : tables) {
-      if (StringUtil::StartsWith(t, prefix)) {
-        t = t.substr(prefix.size());
+    auto prefix =
+        namespace_id.empty() ? string() : (namespace_id + delim);
+
+    // Only prefetch schemas on the first call; keep the cache for subsequent calls.
+    bool need_prefetch = prefetched_schemas.empty();
+    vector<string> table_names;
+    table_names.reserve(raw_entries.size());
+
+    for (auto &entry : raw_entries) {
+      auto tab_pos = entry.find('\t');
+      string name;
+      string schema_json;
+      if (tab_pos != string::npos) {
+        name = entry.substr(0, tab_pos);
+        schema_json = entry.substr(tab_pos + 1);
+      } else {
+        name = entry;
       }
+
+      // Strip namespace prefix from the display name.
+      string display_name = name;
+      if (!prefix.empty() && StringUtil::StartsWith(name, prefix)) {
+        display_name = name.substr(prefix.size());
+      }
+
+      if (need_prefetch && !schema_json.empty()) {
+        prefetched_schemas[name] = schema_json;
+        if (display_name != name) {
+          prefetched_schemas[display_name] = schema_json;
+        }
+      }
+      table_names.push_back(std::move(display_name));
     }
-    return tables;
+    return table_names;
   }
 
 private:
@@ -530,6 +582,10 @@ private:
   string bearer_token_override;
   string api_key_override;
   string headers_tsv;
+
+  // Schema cache populated by GetDefaultEntries (concurrent prefetch).
+  // Maps table_id -> schema JSON string.
+  unordered_map<string, string> prefetched_schemas;
 };
 
 static string GetDatasetDirName(const string &table_name) {

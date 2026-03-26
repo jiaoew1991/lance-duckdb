@@ -9,7 +9,6 @@ use lance_core::Error as LanceError;
 use lance_namespace::models::{
     DeclareTableRequest, DescribeTableRequest, DropTableRequest, ListTablesRequest,
 };
-use lance_namespace::schema::convert_json_arrow_schema;
 use lance_namespace::LanceNamespace;
 use lance_namespace_impls::RestNamespaceBuilder;
 
@@ -82,6 +81,16 @@ fn storage_options_to_tsv(storage_options: std::collections::HashMap<String, Str
         .join("\n")
 }
 
+/// Max concurrent describe_table requests during prefetch.
+const PREFETCH_CONCURRENCY: usize = 10;
+
+/// List tables and prefetch their schemas concurrently.
+///
+/// Returns `Vec<String>` where each entry is either:
+/// - `"table_name\tschema_json"` (schema prefetched successfully), or
+/// - `"table_name"` (schema fetch failed or skipped).
+///
+/// The C++ side parses the tab separator to populate a schema cache.
 fn list_tables_inner(
     endpoint: *const c_char,
     namespace_id: *const c_char,
@@ -90,52 +99,92 @@ fn list_tables_inner(
     delimiter: *const c_char,
     headers_tsv: *const c_char,
 ) -> FfiResult<Vec<String>> {
-    let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
-    let namespace_id = unsafe { cstr_to_str(namespace_id, "namespace_id")? };
-    let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
-    let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
-    let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
-    let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
+    let endpoint_s = unsafe { cstr_to_str(endpoint, "endpoint")? }.to_string();
+    let namespace_id_s = unsafe { cstr_to_str(namespace_id, "namespace_id")? }.to_string();
+    let delimiter_s = unsafe { optional_cstr_to_string(delimiter, "delimiter")? }
+        .unwrap_or_else(|| "$".to_string());
+    let bearer_token_s = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
+    let api_key_s = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+    let headers_tsv_s = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
-    let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let namespace = build_config(
-        endpoint,
-        bearer_token.as_deref(),
-        api_key.as_deref(),
-        headers_tsv.as_deref(),
-    )
-    .delimiter(delimiter)
-    .build();
+    let results = runtime::block_on(async {
+        // Phase 1: list all table names.
+        let list_ns = build_config(
+            &endpoint_s,
+            bearer_token_s.as_deref(),
+            api_key_s.as_deref(),
+            headers_tsv_s.as_deref(),
+        )
+        .delimiter(delimiter_s.clone())
+        .build();
 
-    let tables = runtime::block_on(async move {
-        let mut out = Vec::new();
+        let mut table_names = Vec::new();
         let mut page_token: Option<String> = None;
         loop {
             let mut req = ListTablesRequest::new();
-            req.id = Some(if namespace_id.is_empty() {
+            req.id = Some(if namespace_id_s.is_empty() {
                 Vec::new()
             } else {
-                vec![namespace_id.to_string()]
+                vec![namespace_id_s.clone()]
             });
             req.page_token = page_token.clone();
             req.limit = Some(1000);
-            let resp = namespace.list_tables(req).await.map_err(|err| {
+            let resp = list_ns.list_tables(req).await.map_err(|err| {
                 FfiError::new(
                     ErrorCode::NamespaceListTables,
                     format!("namespace list_tables: {err}"),
                 )
             })?;
-            out.extend(resp.tables);
+            table_names.extend(resp.tables);
             match resp.page_token {
                 Some(token) if !token.is_empty() => page_token = Some(token),
                 _ => break,
+            }
+        }
+
+        // Phase 2: concurrently describe each table to prefetch schemas.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(PREFETCH_CONCURRENCY));
+        let mut handles = Vec::with_capacity(table_names.len());
+
+        for name in &table_names {
+            let ep = endpoint_s.clone();
+            let bt = bearer_token_s.clone();
+            let ak = api_key_s.clone();
+            let delim = delimiter_s.clone();
+            let hdr = headers_tsv_s.clone();
+            let table_name = name.clone();
+            let permit = sem.clone();
+
+            handles.push(tokio::spawn(async move {
+                let _permit = permit.acquire().await.unwrap();
+                let ns = build_config(&ep, bt.as_deref(), ak.as_deref(), hdr.as_deref())
+                    .delimiter(delim)
+                    .build();
+                let mut req = DescribeTableRequest::new();
+                req.id = Some(vec![table_name.clone()]);
+                req.with_table_uri = Some(true);
+                req.load_detailed_metadata = Some(true);
+                let schema_json = match ns.describe_table(req).await {
+                    Ok(resp) => resp.schema.and_then(|s| serde_json::to_string(&s).ok()),
+                    Err(_) => None,
+                };
+                (table_name, schema_json)
+            }));
+        }
+
+        let mut out = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.await {
+                Ok((name, Some(schema))) => out.push(format!("{name}\t{schema}")),
+                Ok((name, None)) => out.push(name),
+                Err(_) => {} // task panicked, skip
             }
         }
         Ok::<_, FfiError>(out)
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
-    Ok(tables)
+    Ok(results)
 }
 
 #[no_mangle]
@@ -649,6 +698,91 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace(
     }
 }
 
+// ── TMP: local convert_json_arrow_schema that supports nested types ──────────
+// Remove once lance-namespace upstream merges the fix:
+// https://github.com/lancedb/lance/pull/XXXX
+mod tmp_schema {
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+    use lance_core::{Error, Result};
+    use lance_namespace::models::{JsonArrowDataType, JsonArrowField, JsonArrowSchema};
+    use std::sync::Arc;
+
+    pub fn convert_schema(json_schema: &JsonArrowSchema) -> Result<ArrowSchema> {
+        let fields: Result<Vec<Field>> = json_schema.fields.iter().map(convert_field).collect();
+        let metadata = json_schema.metadata.as_ref().cloned().unwrap_or_default();
+        Ok(ArrowSchema::new_with_metadata(fields?, metadata))
+    }
+
+    fn convert_field(f: &JsonArrowField) -> Result<Field> {
+        let dt = convert_type(&f.r#type)?;
+        let field = Field::new(&f.name, dt, f.nullable);
+        Ok(match f.metadata.as_ref() {
+            Some(m) => field.with_metadata(m.clone()),
+            None => field,
+        })
+    }
+
+    fn convert_type(t: &JsonArrowDataType) -> Result<DataType> {
+        let name = t.r#type.to_lowercase();
+        match name.as_str() {
+            "null" => Ok(DataType::Null),
+            "bool" | "boolean" => Ok(DataType::Boolean),
+            "int8" => Ok(DataType::Int8),
+            "uint8" => Ok(DataType::UInt8),
+            "int16" => Ok(DataType::Int16),
+            "uint16" => Ok(DataType::UInt16),
+            "int32" => Ok(DataType::Int32),
+            "uint32" => Ok(DataType::UInt32),
+            "int64" => Ok(DataType::Int64),
+            "uint64" => Ok(DataType::UInt64),
+            "float16" => Ok(DataType::Float16),
+            "float32" => Ok(DataType::Float32),
+            "float64" => Ok(DataType::Float64),
+            "decimal128" => {
+                let e = t.length.unwrap_or(0);
+                Ok(DataType::Decimal128((e / 1000) as u8, (e % 1000) as i8))
+            }
+            "date32" => Ok(DataType::Date32),
+            "date64" => Ok(DataType::Date64),
+            "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+            "duration" => Ok(DataType::Duration(TimeUnit::Microsecond)),
+            "utf8" => Ok(DataType::Utf8),
+            "large_utf8" => Ok(DataType::LargeUtf8),
+            "binary" => Ok(DataType::Binary),
+            "large_binary" => Ok(DataType::LargeBinary),
+            "fixed_size_binary" => Ok(DataType::FixedSizeBinary(t.length.unwrap_or(0) as i32)),
+            "list" => {
+                let inner = t.fields.as_ref().and_then(|f| f.first())
+                    .ok_or_else(|| Error::namespace("list type missing inner field"))?;
+                Ok(DataType::List(Arc::new(convert_field(inner)?)))
+            }
+            "large_list" => {
+                let inner = t.fields.as_ref().and_then(|f| f.first())
+                    .ok_or_else(|| Error::namespace("large_list type missing inner field"))?;
+                Ok(DataType::LargeList(Arc::new(convert_field(inner)?)))
+            }
+            "fixed_size_list" => {
+                let inner = t.fields.as_ref().and_then(|f| f.first())
+                    .ok_or_else(|| Error::namespace("fixed_size_list type missing inner field"))?;
+                Ok(DataType::FixedSizeList(Arc::new(convert_field(inner)?), t.length.unwrap_or(0) as i32))
+            }
+            "struct" => {
+                let fields = t.fields.as_ref()
+                    .ok_or_else(|| Error::namespace("struct type missing fields"))?;
+                let fs: Result<Vec<Field>> = fields.iter().map(convert_field).collect();
+                Ok(DataType::Struct(fs?.into()))
+            }
+            "map" => {
+                let entries = t.fields.as_ref().and_then(|f| f.first())
+                    .ok_or_else(|| Error::namespace("map type missing entries field"))?;
+                Ok(DataType::Map(Arc::new(convert_field(entries)?), false))
+            }
+            _ => Err(Error::namespace(format!("Unsupported Arrow type: {name}"))),
+        }
+    }
+}
+// ── end TMP ─────────────────────────────────────────────────────────────────
+
 /// Convert a JSON Arrow schema string to Arrow C Data Interface ArrowSchema.
 #[no_mangle]
 pub unsafe extern "C" fn lance_json_arrow_schema_to_c(
@@ -664,7 +798,9 @@ pub unsafe extern "C" fn lance_json_arrow_schema_to_c(
                     format!("failed to parse JSON arrow schema: {err}"),
                 )
             })?;
-        let arrow_schema = convert_json_arrow_schema(&json_arrow).map_err(|err| {
+        // TMP: use local schema converter that supports nested types.
+        // Switch back to convert_json_arrow_schema once upstream lance-namespace is fixed.
+        let arrow_schema = tmp_schema::convert_schema(&json_arrow).map_err(|err| {
             FfiError::new(
                 ErrorCode::SchemaExport,
                 format!("failed to convert JSON arrow schema: {err}"),
